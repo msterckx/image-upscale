@@ -1,5 +1,6 @@
 FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 
+# v 1.0
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1

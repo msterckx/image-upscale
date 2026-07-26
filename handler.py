@@ -254,4 +254,21 @@ if __name__ == "__main__":
         f"cuda={torch.cuda.is_available()}",
         flush=True,
     )
-    runpod.serverless.start({"handler": handler})
+
+    if os.environ.get("LOCAL_TEST") == "1":
+        test_job = {
+            "id": "local-test",
+            "input": {
+                "source": "upscale/input/graccius-brothers-3.webp",
+                "scale": 4,
+                "format": "png",
+                "tile": 0,
+            },
+        }
+
+        result = handler(test_job)
+
+        print("Local test result:")
+        print(result)
+    else:
+        runpod.serverless.start({"handler": handler})

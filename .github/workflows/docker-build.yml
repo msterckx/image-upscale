@@ -31,5 +31,5 @@ jobs:
           file: Dockerfile.txt
           push: true
           tags: |
-            msterckx/image-upscale-serverless:1.0
+            msterckx/image-upscale-serverless:1.1
             msterckx/image-upscale-serverless:latest

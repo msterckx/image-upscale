@@ -15,14 +15,25 @@ Input object example:
   }
 }
 
+"source" also accepts a list, and "sources" is available as an alias, so a
+single job can upscale a batch:
+{
+  "input": {
+    "sources": ["upscale/input/a.jpg", "upscale/input/b.png"],
+    "scale": 4
+  }
+}
+
 The worker reads:
     /runpod-volume/<source>
 
 and writes:
     /runpod-volume/upscale/output/<job-id>/<filename>
 
-The response returns the relative object key so the caller can fetch it
-through the Runpod Network Volume S3-compatible API.
+The response returns the relative object keys so the caller can fetch them
+through the Runpod Network Volume S3-compatible API. Results are always
+returned in the "images" list, in the same order as the requested sources;
+sources that fail are reported in "failed" while the rest still complete.
 """
 
 import os
@@ -148,6 +159,61 @@ def resolve_source(source_key: str) -> Path:
     return source_path
 
 
+def collect_source_keys(job_input: dict) -> list[str]:
+    """
+    Accept "source"/"sources" as either a single string or a list of strings and
+    normalise them into an ordered, de-duplicated list of keys.
+    """
+    raw_values = []
+
+    for field in ("source", "sources"):
+        value = job_input.get(field)
+
+        if value is None:
+            continue
+        if isinstance(value, str):
+            raw_values.append(value)
+        elif isinstance(value, (list, tuple)):
+            raw_values.extend(value)
+        else:
+            raise ValueError(f'"{field}" must be a string or a list of strings')
+
+    source_keys = []
+
+    for value in raw_values:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("every source must be a non-empty string")
+
+        key = value.strip()
+        if key not in source_keys:
+            source_keys.append(key)
+
+    if not source_keys:
+        raise ValueError(
+            'Missing required input field "source", for example '
+            '"upscale/input/photo.jpg" or ["upscale/input/a.jpg", '
+            '"upscale/input/b.jpg"]'
+        )
+
+    return source_keys
+
+
+def unique_destination(destination_dir: Path, stem: str, suffix: str, taken: set[str]) -> Path:
+    """
+    Keep batch outputs from overwriting each other when two sources share a
+    filename (for example input/a/photo.jpg and input/b/photo.jpg).
+    """
+    name = f"{stem}{suffix}"
+    counter = 1
+
+    while name in taken:
+        name = f"{stem}-{counter}{suffix}"
+        counter += 1
+
+    taken.add(name)
+    return destination_dir / name
+
+
 def upscale_image(
     source_path: Path,
     destination_path: Path,
@@ -185,12 +251,7 @@ def upscale_image(
 def handler(job: dict) -> dict:
     job_input = job.get("input") or {}
 
-    source_key = job_input.get("source")
-    if not source_key:
-        raise ValueError(
-            'Missing required input field "source", for example '
-            '"upscale/input/photo.jpg"'
-        )
+    source_keys = collect_source_keys(job_input)
 
     scale = float(job_input.get("scale", 4.0))
     if scale <= 0:
@@ -206,46 +267,74 @@ def handler(job: dict) -> dict:
     if tile < 0:
         raise ValueError("tile must be 0 or a positive integer")
 
-    source_path = resolve_source(str(source_key))
-
     job_id = str(job.get("id") or "manual")
     suffix = ".png" if output_format == "png" else ".jpg"
-
     destination_dir = OUTPUT_DIR / job_id
-    destination_path = destination_dir / f"{source_path.stem}{suffix}"
 
-    print(
-        f"Upscaling {source_path} -> {destination_path} "
-        f"(scale={scale}, format={output_format}, tile={tile})",
-        flush=True,
-    )
+    images: list[dict] = []
+    failed: list[dict] = []
+    taken_names: set[str] = set()
 
-    (
-        source_width,
-        source_height,
-        output_width,
-        output_height,
-    ) = upscale_image(
-        source_path=source_path,
-        destination_path=destination_path,
-        outscale=scale,
-        output_format=output_format,
-        tile=tile,
-    )
+    for index, source_key in enumerate(source_keys, start=1):
+        try:
+            source_path = resolve_source(source_key)
+            destination_path = unique_destination(
+                destination_dir, source_path.stem, suffix, taken_names
+            )
 
-    # Return a Network Volume/S3 object key, not an internal container path.
-    output_key = destination_path.relative_to(VOLUME_ROOT).as_posix()
+            print(
+                f"[{index}/{len(source_keys)}] Upscaling {source_path} -> "
+                f"{destination_path} "
+                f"(scale={scale}, format={output_format}, tile={tile})",
+                flush=True,
+            )
 
-    return {
-        "output_key": output_key,
-        "source": str(source_key),
-        "source_width": source_width,
-        "source_height": source_height,
-        "width": output_width,
-        "height": output_height,
+            (
+                source_width,
+                source_height,
+                output_width,
+                output_height,
+            ) = upscale_image(
+                source_path=source_path,
+                destination_path=destination_path,
+                outscale=scale,
+                output_format=output_format,
+                tile=tile,
+            )
+        except Exception as exc:  # keep the rest of the batch going
+            print(f"Failed to upscale {source_key}: {exc}", flush=True)
+            failed.append({"source": source_key, "error": str(exc)})
+            continue
+
+        images.append(
+            {
+                # A Network Volume/S3 object key, not an internal container path.
+                "output_key": destination_path.relative_to(VOLUME_ROOT).as_posix(),
+                "source": source_key,
+                "source_width": source_width,
+                "source_height": source_height,
+                "width": output_width,
+                "height": output_height,
+            }
+        )
+
+    if not images:
+        details = "; ".join(f"{item['source']}: {item['error']}" for item in failed)
+        raise RuntimeError(f"No images could be upscaled ({details})")
+
+    result = {
+        "images": images,
+        "count": len(images),
+        "failed": failed,
         "scale": scale,
         "format": output_format,
     }
+
+    # Keep the original single-image response shape for existing callers.
+    if len(source_keys) == 1 and not failed:
+        result.update(images[0])
+
+    return result
 
 
 if __name__ == "__main__":
@@ -256,10 +345,14 @@ if __name__ == "__main__":
     )
 
     if os.environ.get("LOCAL_TEST") == "1":
+        test_sources = os.environ.get(
+            "LOCAL_TEST_SOURCES", "upscale/input/graccius-brothers-3.webp"
+        )
+
         test_job = {
             "id": "local-test",
             "input": {
-                "source": "upscale/input/graccius-brothers-3.webp",
+                "sources": [s.strip() for s in test_sources.split(",") if s.strip()],
                 "scale": 4,
                 "format": "png",
                 "tile": 0,
